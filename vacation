@@ -1,0 +1,490 @@
+#!/usr/bin/python
+
+# 21 May 2012 Thomas Uphill <uphill@ias.edu>
+# Vacation Script Replacement
+
+# config file for ldap settings
+# read current state and print by default
+
+import ldap
+import ConfigParser
+import getpass
+import sys
+import select
+import termios
+import tty
+import os
+import tempfile
+import datetime
+import time
+
+# read in the configuration file
+config = ConfigParser.ConfigParser()
+try:
+	config.readfp(open('/etc/vacation.cfg'))
+except:
+	try:
+		config.readfp(open('vacation.cfg'))
+	except:
+		print ("Could not read vacation configuration file")
+		sys.exit(1)
+
+# read in ldap settings (need to error if not found)
+lserver = config.get('ldap','server')
+lbase = config.get('ldap','base')
+# read in vacation attributes (need to error if not found)
+global vactive, vinfo, vstart, vend
+vactive = config.get('vacation','active')
+vinfo = config.get('vacation','info')
+vstart = config.get('vacation','start')
+vend = config.get('vacation','end')
+# read in the boolean values, in the event that someone uses 1/0,yes/no instead of TRUE/FALSE
+global active,inactive
+active = config.get('bool','active')
+inactive = config.get('bool','inactive')
+
+
+# make password a global so we only need to ask once
+global passwd,username,dn
+passwd = None
+username = None
+dn = None
+
+# state of the vacation
+global start,end,info,state
+state = None
+start = None
+end = None
+info = None
+
+##########################################
+
+class color:
+	FAIL = '\033[91m'
+	OK = '\033[92m'
+	END = '\033[0m'
+
+def getkey():
+  """read a single key from the keyboard, better than requiring the user hit return"""
+
+  old = termios.tcgetattr(sys.stdin)
+  tty.setraw(sys.stdin.fileno())
+  select.select([sys.stdin],[],[],0)
+  answer = sys.stdin.read(1)
+  termios.tcsetattr(sys.stdin,termios.TCSADRAIN,old)
+  if answer != '\r': sys.stdout.write(answer)
+  return answer
+
+def getanswer(question,yes = 'yY',no = 'nN'):
+	"""print question, wait for correct response, repeat question on wrong answer
+	return True if answer in yes
+	return False if answer in no
+	"""
+
+	while True:
+		sys.stdout.write(question + "(%s%sq)" % (yes.upper()[0],no.upper()[0]))
+		answer = getkey()
+		if answer in yes: return True
+		if answer in no: return False
+		if answer in '[qQ]': 
+			print "Exit"
+			sys.exit(1)
+		print
+
+def get_date(prompt,current_date):
+	"""ask user to enter a valid start time/date and try to make a timestamp out of that"""
+
+	while True:
+		# set a default based on the current setting
+		if current_date == None:
+			current_date = time.mktime(time.localtime())
+		try:
+			current_pretty = datetime.datetime.fromtimestamp(int(current_date)).strftime('%m/%d/%Y %H:%M')
+		except:
+			current_pretty = '01/01/1970 00:00'
+
+		sys.stdout.write(prompt + "(MM/DD/YYYY HH:MM) [return for %s]: " % current_pretty)
+		answer = sys.stdin.readline().strip()
+		if answer == "":
+			return current_date
+		try:
+			timestamp = time.mktime(datetime.datetime.strptime(answer,'%m/%d/%Y %H:%M').timetuple())
+			return timestamp
+		except:
+			try:
+				timestamp = time.mktime(datetime.datetime.strptime(answer,'%m/%d/%Y').timetuple())
+				return timestamp
+			except:
+				pass
+
+def menu(prompt,choices):
+	"""print a prompt, then each of the choices on a line by itself
+	if the user selects a choice, return the dict of that value
+	"""
+	while True:
+		print prompt
+		for i in range(len(choices)):
+			print "\t%s: %s" % (i,choices[i][0])
+		sys.stdout.write("0-%d,q for quit: " % (i))
+		answer = getkey()
+		if answer in '[qQ':
+			print
+			print "Exit"
+			sys.exit(1)
+		elif answer == '\r':
+			return choices[0][1]
+		try:
+			num = int(answer)
+		except:
+			print
+			continue
+		if num in range(len(choices)):
+			return choices[num][1]
+		print
+	print
+
+def getchoice(question,default_choice,choices):
+	"""print question, wait for correct choice from one of the multiple choices
+	return default_choice if user hits return
+	return choice otherwise
+	"""
+
+	while True:
+		print question
+		print "\t0: %s" % default_choice
+		c = 1 
+		for i in choices:
+			print "\t%s: %s" % (c,i)
+			c = c + 1
+		sys.stdout.write("return %s or 0-%s,q for quit" % (default_choice,len(choices)))
+		answer = getkey()
+		if answer in '[qQ':
+			print
+			print "Exit"
+			sys.exit(1)
+		elif answer == '\r':
+			return default_choice
+		try:
+			num = int(answer)
+		except:
+			print
+			continue
+		if num == 0:
+			return default_choice
+		elif num in range(len(choices)+1):
+			return choices[num-1]
+		print
+	print
+
+def bind():
+	global passwd
+	global l
+	if passwd is None:
+		print
+		passwd = getpass.getpass('Please enter your password:')
+	if dn is None:
+		get_info()
+	try:
+		l.simple_bind_s(dn,passwd)
+	except:
+		print "Could not bind to ldap"
+		sys.exit(20)
+
+
+def get_user():
+	global username
+	if username is None:
+		try: 
+			username = getpass.getuser()
+			username = 'priya'
+		except:
+			print "Could not determine your username"
+			sys.exit(1)
+
+def get_info():
+	"""search ldap for the current settings for the given user
+	populate the global variables"""
+	global vactive,vinfo,vstart,vend,state
+	global start,end,info
+	global dn
+	global lbase
+	global username
+
+	if username is None:
+		get_user()
+	try:
+		r = l.search_s(lbase,ldap.SCOPE_SUBTREE, 'uid=%s' % username,[vactive,vinfo,vstart,vend])
+	except:
+		print "Error searching ldap"
+		sys.exit(10)
+	state = inactive
+	start = None
+	end = None
+	info = None
+
+	# state = is vacation currently active
+	try:
+		state = r[0][1][vactive][0]
+	except:
+		state = inactive
+	try:
+		info = r[0][1][vinfo][0]
+	except:
+		pass
+	try:
+		start = r[0][1][vstart][0]
+		end = r[0][1][vend][0]
+	except:
+		pass
+		
+	dn = r[0][0]
+
+def print_period():
+	global start, end
+	# start and end dates for the vacation
+	if (start not in [None,'']) and (end not in [None,'']):
+		# format start and end for printing
+		try:
+			start_pretty = datetime.datetime.fromtimestamp(int(start)).strftime('%A %B %d, %Y %H:%M')
+			end_pretty = datetime.datetime.fromtimestamp(int(end)).strftime('%A %B %d, %Y %H:%M')
+		except:
+			print color.FAIL + "Your vacation start and end dates are invalid" + color.END
+			return
+		print
+		print "Your vacation is scheduled to start on " + start_pretty
+		print "                            and end on " + end_pretty
+	else:
+		print 
+		print "Your vacation has no start and end dates defined."
+
+def print_info():
+	"""search for current vacation settings for the user"""
+	global start,end,info,state,username
+	if state == None:
+		get_info()
+	
+	os.system('clear')
+	print('Vacation (gnarwl) for %s' % username)
+	print
+	print
+	# if the vacation message is not empty, print it
+	if info is not None:
+		print "Your vacation reply is currently:"
+		print "*"*78
+		print info
+		print "*"*78
+		print
+	else:
+		print "Your vacation reply is currently empty."
+	print_period()
+
+	print
+
+def save_info(newinfo):
+	"""check if there is already an info in the ldap, if so use replace
+	if not, use add
+	"""
+	global dn
+	global vinfo
+	r = l.search_s(dn,ldap.SCOPE_BASE,'uid=*',[vinfo])
+	hasinfo = None
+	try:
+		hasinfo = r[0][1][vinfo]
+	except:
+		pass
+	if hasinfo is not None:
+		mod_attrs = [ ( ldap.MOD_REPLACE, vinfo, newinfo ) ]
+	else:
+		mod_attrs = [ ( ldap.MOD_ADD, vinfo, newinfo ) ]
+	# make the change to ldap
+	if passwd is None: bind()
+	try:
+		r = l.modify_s(dn,mod_attrs)
+		global info
+		info = newinfo
+	except:
+		print color.FAIL + "Could not modify your vacation message" + color.END
+		sys.exit(1)
+
+def edit_vacation():
+	"""ask which editor to use, then allow user to edit the vacation message.
+	store the result back into ldap, which will require their password"""
+	global start,end,info
+
+	try:
+		prefeditor = os.environ['EDITOR']
+	except:
+		prefeditor = 'vim'
+
+	editors = ['nano']
+	try:
+		os.environ['DISPLAY']
+		editors.append('gedit')
+		editors.append('xemacs')
+	except:
+		pass
+
+	editor=getchoice("Which text editor would you like to use",prefeditor,editors)
+	# grab the current info, save to a temp file, let them edit it
+	tmpfile = tempfile.mkstemp(suffix='-vacation')
+	os.write(tmpfile[0],info)
+	os.close(tmpfile[0])
+	os.system("%s %s" % (editor,tmpfile[1]))
+	# print the edit they made
+	f = open(tmpfile[1])
+	newinfo = f.read()
+	if newinfo != info:
+		print color.FAIL + "*"*30 + " Old Vacation " + "*"*30 + color.END
+		print info
+		print color.OK + "*"*30 + " New Vacation " + "*"*30 + color.END
+		print newinfo
+		answer = getanswer("Do you wish to save this change?")
+		if answer:
+			save_info(newinfo)
+		return
+
+def toggle_vacation():
+	"""enable or disable vacation"""
+	global l
+	global vactive,state
+	global inactive, active
+
+	# find if there is a vacation setting for the user yet
+	r = l.search_s(dn,ldap.SCOPE_BASE,'uid=*',[vactive])
+#	print "state: %s (%s,%s) " % (state,active,inactive)
+	if state == active:
+		enable = inactive
+	else:
+		enable = active
+#	print "enable: %s" % enable
+	try:
+		r[0][1][vactive]
+		mod_attrs = [ ( ldap.MOD_REPLACE, vactive, enable ) ]
+	except:
+		mod_attrs = [ ( ldap.MOD_ADD, vactive, enable ) ]
+	# make the change to ldap
+	if passwd is None: bind()
+	try:
+		r = l.modify_s(dn,mod_attrs)
+		state = enable
+	except:
+		print color.FAIL + "Failed to change your vacation status" + color.END
+		print r
+		print mod_attrs
+		print "%s %s" % (state,enable)
+		os.system('sleep 15')
+	
+def vacation_period_remove():
+	"""remove the vacation period and just rely on active vs inactive"""
+
+	global vstart,vend
+	global start,end
+	global l
+	global passwd
+
+	print_period()
+	answer = getanswer("Remove the start end end dates on your vacation?")
+	if answer:
+		r = l.search_s(dn,ldap.SCOPE_BASE,'uid=*',[vstart,vend])
+		for attrib in vstart,vend:
+			try: 
+				x = r[0][1][attrib][0]
+				mod_attrs = [ ( ldap.MOD_DELETE, attrib, None ) ]
+				if passwd is None: bind()
+				try:
+					s = l.modify_s(dn,mod_attrs)
+					start = None
+					end = None
+				except:
+					print "Could not remove %s" % attrib
+			except:
+				pass
+
+def vacation_period():
+	"""set the vacation validity period
+	ideally show them a calendar and let them pick the date but we can settle for something less cool for now.
+	"""
+
+	global vstart,vend
+	global start,end
+	global l
+	global passwd
+
+  # print current settings
+	print_period()
+	os.system('cal')
+
+	# ask user for dates
+	start = get_date('Start Date',start)
+	end = get_date('End Date',end)
+	# make the change
+	# if there is no start or end in ldap, we do an add, if they are there we do modify
+	r = l.search_s(dn,ldap.SCOPE_BASE,'uid=*',[vstart,vend])
+	try:
+		current_start = r[0][1][vstart][0]
+		mod_attrs = [ ( ldap.MOD_REPLACE, vstart, str(int(float(start))) ) ]
+	except:
+		mod_attrs = [ ( ldap.MOD_ADD, vstart, str(int(float(start))) ) ]
+	if passwd is None: bind()
+	try:
+		s = l.modify_s(dn,mod_attrs)
+	except:
+		print "Could not modify your start time"
+		print dn
+		print mod_attrs
+		os.system('sleep 5')
+
+	# paranoia
+	mod_attrs = None
+	try:
+		current_end = r[0][1][vend][0]
+		mod_attrs = [ ( ldap.MOD_REPLACE, vend, str(int(float(end))) ) ]
+	except:
+		mod_attrs = [ ( ldap.MOD_ADD, vend, str(int(float(end))) ) ]
+	try:
+		s = l.modify_s(dn,mod_attrs)
+	except:
+		print "Could not modify your end time"
+		print dn
+		print mod_attrs
+		os.system('sleep 5')
+
+#########################################
+
+# open connection to ldap
+global l
+try:
+  l = ldap.initialize('ldaps://%s' % lserver)
+except:
+	print("Could not open connection to %s" % lserver,'')
+	sys.exit(1)
+
+username = getpass.getuser()
+username = 'priya'
+
+# make a menu of options based on current state
+# if state is inactive
+#   ask to enable vacation
+#     if you are enabling, then do the edit, start/end stuff
+# if state is active
+#   ask to disable vacation
+#   ask to change start/end
+#   ask to edit
+
+while True:
+	print_info()
+
+	choices = list()
+	if state == inactive:
+				prompt = "Your vacation is currently " + color.FAIL + "inactive" + color.END
+				choices.append(['Would you like to enable vacation?','toggle_vacation'])
+	else:
+				prompt = "Your vacation is currently " + color.OK + "active" + color.END
+				choices.append(['Would you like to disable vacation?','toggle_vacation'])
+				choices.append(['Would you like to change the start/end period for your vacation?','vacation_period'])
+				choices.append(['Would you like to remove the start/end period for your vacation?','vacation_period_remove'])
+				choices.append(['Would you like to edit your away message?','edit_vacation'])
+
+	answer = menu(prompt,choices)
+	print
+	locals()[answer]()
