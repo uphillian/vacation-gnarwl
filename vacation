@@ -196,7 +196,6 @@ def get_user():
 	if username is None:
 		try: 
 			username = getpass.getuser()
-			username = 'priya'
 		except:
 			print "Could not determine your username"
 			sys.exit(1)
@@ -327,7 +326,10 @@ def edit_vacation():
 	editor=getchoice("Which text editor would you like to use",prefeditor,editors)
 	# grab the current info, save to a temp file, let them edit it
 	tmpfile = tempfile.mkstemp(suffix='-vacation')
-	os.write(tmpfile[0],info)
+	try:
+		os.write(tmpfile[0],info)
+	except:
+		pass
 	os.close(tmpfile[0])
 	os.system("%s %s" % (editor,tmpfile[1]))
 	# print the edit they made
@@ -460,7 +462,6 @@ except:
 	sys.exit(1)
 
 username = getpass.getuser()
-username = 'priya'
 
 # make a menu of options based on current state
 # if state is inactive
