@@ -29,3 +29,5 @@ ldap attributes to store your vacation information.  The [bool] clause is there 
 and FALSE to store the booleans for setting gnarwl active.
 
 Suggestions and rewrites always welcome...
+
+Released under the MIT license included in LICENSE
